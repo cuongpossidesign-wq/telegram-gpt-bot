@@ -1,16 +1,17 @@
 const TelegramBot = require('node-telegram-bot-api');
-const OpenAI = require('openai');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT ||
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const MODEL_NAME     = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+const SYSTEM_PROMPT  = process.env.SYSTEM_PROMPT ||
   'Bạn là một trợ lý AI thông minh, thân thiện và hữu ích. Hãy trả lời bằng ngôn ngữ mà người dùng sử dụng.';
 
-const bot    = new TelegramBot(TELEGRAM_TOKEN);
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const bot   = new TelegramBot(TELEGRAM_TOKEN);
+const genAI = new GoogleGenerativeAI(GOOGLE_API_KEY);
 
 // In-memory conversation history (persists while function is warm)
+// Gemini format: { role: "user" | "model", parts: [{ text: "..." }] }
 const conversationHistory = new Map();
 const MAX_HISTORY = 20;
 
@@ -21,20 +22,29 @@ function getUserHistory(userId) {
   return conversationHistory.get(userId);
 }
 
-async function getChatGPTResponse(userId, userMessage) {
+async function getGeminiResponse(userId, userMessage) {
   const history = getUserHistory(userId);
-  history.push({ role: 'user', content: userMessage });
-  while (history.length > MAX_HISTORY) history.shift();
-
-  const response = await openai.chat.completions.create({
-    model: MODEL,
-    messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...history],
-    max_tokens: 1000,
-    temperature: 0.7,
+  const model = genAI.getGenerativeModel({ 
+    model: MODEL_NAME, 
+    systemInstruction: SYSTEM_PROMPT 
   });
 
-  const assistantMessage = response.choices[0].message.content;
-  history.push({ role: 'assistant', content: assistantMessage });
+  const chat = model.startChat({
+    history: history,
+  });
+
+  const result = await chat.sendMessage(userMessage);
+  const response = await result.response;
+  const assistantMessage = response.text();
+
+  // Update history from chat session
+  const newHistory = await chat.getHistory();
+  if (newHistory.length > MAX_HISTORY) {
+    conversationHistory.set(userId, newHistory.slice(newHistory.length - MAX_HISTORY));
+  } else {
+    conversationHistory.set(userId, newHistory);
+  }
+
   return assistantMessage;
 }
 
@@ -48,7 +58,7 @@ async function handleMessage(msg) {
   if (text === '/start') {
     const name = msg.from?.first_name || 'bạn';
     await bot.sendMessage(chatId,
-      `👋 Xin chào ${name}!\n\nTôi là ChatBot AI tích hợp ChatGPT.\nHãy nhắn tin bất cứ điều gì!\n\n📌 Lệnh:\n/start - Bắt đầu\n/clear - Xóa lịch sử\n/help  - Trợ giúp`
+      `👋 Xin chào ${name}!\n\nTôi là ChatBot AI tích hợp Gemini Pro.\nHãy nhắn tin bất cứ điều gì!\n\n📌 Lệnh:\n/start - Bắt đầu\n/clear - Xóa lịch sử\n/help  - Trợ giúp`
     );
     return;
   }
@@ -61,7 +71,7 @@ async function handleMessage(msg) {
 
   if (text === '/help') {
     await bot.sendMessage(chatId,
-      `🤖 *ChatGPT Bot*\n\nNhắn tin trực tiếp để nói chuyện với AI.\n\n*Lệnh:*\n/start - Khởi động\n/clear - Xóa lịch sử\n/help  - Trợ giúp\n\n*Model:* ${MODEL}`,
+      `🤖 *Gemini Bot*\n\nNhắn tin trực tiếp để nói chuyện với AI của Google.\n\n*Lệnh:*\n/start - Khởi động\n/clear - Xóa lịch sử\n/help  - Trợ giúp\n\n*Model:* ${MODEL_NAME}`,
       { parse_mode: 'Markdown' }
     );
     return;
@@ -70,22 +80,21 @@ async function handleMessage(msg) {
   await bot.sendChatAction(chatId, 'typing');
 
   try {
-    const response = await getChatGPTResponse(userId, text);
+    const response = await getGeminiResponse(userId, text);
     await bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
   } catch (error) {
-    console.error('Error:', error.message);
+    console.error('Gemini Error:', error.message);
     let errorMsg = '❌ Lỗi xử lý yêu cầu. Vui lòng thử lại!';
-    if (error.status === 429) errorMsg = '⚠️ Đã vượt giới hạn API. Thử lại sau ít phút.';
-    if (error.status === 401) errorMsg = '⚠️ API key không hợp lệ.';
+    if (error.message.includes('429')) errorMsg = '⚠️ Hết hạn mức API Gemini. Thử lại sau ít phút.';
+    if (error.message.includes('API_KEY_INVALID')) errorMsg = '⚠️ API key Google không hợp lệ.';
     await bot.sendMessage(chatId, errorMsg);
   }
 }
 
 // Vercel serverless handler
 module.exports = async (req, res) => {
-  // Only accept POST requests from Telegram
   if (req.method !== 'POST') {
-    return res.status(200).json({ status: 'Telegram GPT Bot is running!' });
+    return res.status(200).json({ status: 'Telegram Gemini Bot is running!' });
   }
 
   try {
@@ -97,6 +106,5 @@ module.exports = async (req, res) => {
     console.error('Webhook error:', error);
   }
 
-  // Always respond 200 to Telegram immediately
   res.status(200).json({ ok: true });
 };
